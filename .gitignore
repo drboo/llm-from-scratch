@@ -1,0 +1,19 @@
+# Generated / large artifacts
+data/
+checkpoints/
+*.bin
+*.pt
+*.safetensors
+tokeniser/tokenizer.json
+tokenizer/tokenizer.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Misc
+.DS_Store
+wandb/
