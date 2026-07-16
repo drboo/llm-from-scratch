@@ -52,15 +52,14 @@ def top_p_filter(logits: torch.Tensor, p: float) -> torch.Tensor:
     """Zero out tokens whose cumulative softmax probability exceeds p (nucleus)."""
     if p >= 1.0:
         return logits
-    probs      = F.softmax(logits, dim=-1)
-    sorted_p, sorted_idx = torch.sort(probs, descending=True)
-    cumulative = sorted_p.cumsum(dim=-1)
-    # Remove tokens once cumulative prob exceeds p; keep at least one token
-    remove_mask = (cumulative - sorted_p) > p
-    sorted_logits = logits.gather(-1, sorted_idx)
-    sorted_logits[remove_mask] = float("-inf")
-    # Scatter back to original order
-    return sorted_logits.scatter(-1, sorted_idx, sorted_logits)
+    probs = F.softmax(logits, dim=-1)
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    cumulative = sorted_probs.cumsum(dim=-1)
+    # Mark tokens to remove in sorted order (shift by one to keep at least one)
+    sorted_remove = (cumulative - sorted_probs) > p
+    # Scatter the boolean mask back to the original token ordering
+    remove_mask = torch.zeros_like(sorted_remove).scatter_(-1, sorted_idx, sorted_remove)
+    return logits.masked_fill(remove_mask, float("-inf"))
 
 
 @torch.no_grad()
