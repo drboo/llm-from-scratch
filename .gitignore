@@ -1,7 +1,7 @@
-# Generated / large artifacts
-data/
+# Generated / large artifacts — track code, ignore binary data
+data/toy/
+data/*.bin
 checkpoints/
-*.bin
 *.pt
 *.safetensors
 tokeniser/tokenizer.json
