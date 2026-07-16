@@ -1,5 +1,5 @@
 """
-Day 10: Production-quality pretraining loop.
+Day 10 / 13: Production-quality pretraining loop.
 
 Features:
   - Cosine LR schedule with linear warmup
@@ -9,11 +9,13 @@ Features:
   - Periodic val loss evaluation
   - Checkpoint save / resume
   - Optional W&B logging
+  - Sample progression: save generated text at every checkpoint (Day 13)
 
 Usage:
     python train/pretrain.py                          # nano defaults
     python train/pretrain.py --resume checkpoints/ckpt_0500.pt
     python train/pretrain.py --wandb-project my-llm
+    python train/pretrain.py --sample-prompt "Once upon a time" --sample-steps 500
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 from model.gpt import GPT, ModelConfig
 from data.dataloader import get_batch
 from train.checkpoint import save as save_ckpt, load as load_ckpt
+from inference.sample import sample as generate_sample
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +81,13 @@ class TrainConfig:
     # ── optional integrations ────────────────────────────────────────────────
     wandb_project: str = ""   # empty = disabled
     resume:        str = ""   # path to checkpoint, empty = fresh start
+
+    # ── sample progression (Day 13) ──────────────────────────────────────────
+    sample_prompt: str = ""   # if set, generate a sample at each checkpoint
+    sample_steps:  int = 0    # generate every N steps (0 = same as ckpt_every)
+    sample_n:      int = 200  # tokens to generate per sample
+    sample_top_k:  int = 50
+    sample_temp:   float = 0.8
 
     def model_config(self) -> ModelConfig:
         return ModelConfig(
@@ -149,6 +159,35 @@ def eval_loss(model: GPT, cfg: TrainConfig, device: torch.device) -> float:
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+
+
+def _save_sample(model: GPT, cfg: TrainConfig, step: int, device: torch.device) -> None:
+    """Generate from cfg.sample_prompt and write to out_dir/samples/step_XXXXXX.txt."""
+    prompt_ids = torch.tensor(
+        [b for b in cfg.sample_prompt.encode("utf-8")],
+        dtype=torch.long, device=device,
+    ).unsqueeze(0)
+    # Clamp to vocab — byte encoding valid for vocab≥256; for BPE models use codec
+    if prompt_ids.max().item() >= cfg.vocab_size:
+        prompt_ids = prompt_ids % cfg.vocab_size
+
+    out = generate_sample(
+        model, prompt_ids,
+        n_new=cfg.sample_n,
+        temperature=cfg.sample_temp,
+        top_k=cfg.sample_top_k,
+    )
+    new_ids = out[0, prompt_ids.shape[1]:].tolist()
+    try:
+        text = bytes([i for i in new_ids if i < 256]).decode("utf-8", errors="replace")
+    except Exception:
+        text = str(new_ids)
+
+    samples_dir = Path(cfg.out_dir) / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    path = samples_dir / f"step_{step:06d}.txt"
+    path.write_text(f"=== step {step} | prompt: {cfg.sample_prompt!r} ===\n{text}\n")
+    print(f"  ↳ sample  → {path}")
 
 
 def train(cfg: TrainConfig) -> None:
@@ -244,6 +283,11 @@ def train(cfg: TrainConfig) -> None:
             save_ckpt(ckpt_path, model, optimizer, step, train_loss)
             print(f"  ↳ saved {ckpt_path}")
 
+        # ── Sample progression ────────────────────────────────────────────────
+        sample_every = cfg.sample_steps if cfg.sample_steps > 0 else cfg.ckpt_every
+        if cfg.sample_prompt and step % sample_every == 0:
+            _save_sample(model, cfg, step, device)
+
     if wb:
         wb.finish()
 
@@ -268,8 +312,14 @@ def _parse() -> TrainConfig:
     p.add_argument("--eval-every",   type=int,   default=250)
     p.add_argument("--ckpt-every",   type=int,   default=500)
     p.add_argument("--log-every",    type=int,   default=10)
-    p.add_argument("--resume",       default="",  help="path to checkpoint")
-    p.add_argument("--wandb-project",default="")
+    p.add_argument("--resume",        default="",  help="path to checkpoint")
+    p.add_argument("--wandb-project", default="")
+    p.add_argument("--sample-prompt", default="",  help="generate sample text at each checkpoint")
+    p.add_argument("--sample-steps",  type=int, default=0,
+                   help="sample every N steps (0 = same as --ckpt-every)")
+    p.add_argument("--sample-n",      type=int,   default=200)
+    p.add_argument("--sample-top-k",  type=int,   default=50)
+    p.add_argument("--sample-temp",   type=float, default=0.8)
     args = p.parse_args()
 
     cfg = TrainConfig()
