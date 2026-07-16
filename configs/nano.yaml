@@ -1,0 +1,5 @@
+n_layer: 6
+n_head: 6
+d_model: 384
+ctx: 256
+vocab_size: 32000
