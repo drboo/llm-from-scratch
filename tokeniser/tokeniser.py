@@ -26,8 +26,19 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 VOCAB_SIZE = 32_000
 SAVE_PATH = Path(__file__).parent / "tokenizer.json"
 
-# Defined now so they never need retrofitting into a trained tokenizer.
-SPECIALS = ["<|pad|>", "<|user|>", "<|assistant|>", "<|end|>"]
+# Full special-token set — aligned with Codec in tokenizer.py so the trained
+# tokenizer.json is immediately usable by the application layer without
+# retrofitting.  Order matters: the trainer assigns ids in this order.
+SPECIALS = [
+    # control
+    "<|pad|>", "<|bos|>", "<|eos|>",
+    # chat template
+    "<|user|>", "<|assistant|>", "<|endofturn|>",
+    # fill-in-the-middle (FIM)
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+    # domain routing (prepended to every pretraining document)
+    "<|text|>", "<|email|>", "<|py|>", "<|rs|>", "<|cpp|>",
+]
 
 # GPT-4-style split pattern.  The critical arm for Python is \s+(?!\S):
 # whitespace runs that are NOT followed by a non-whitespace character stay

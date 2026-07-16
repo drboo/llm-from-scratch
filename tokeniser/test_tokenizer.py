@@ -14,7 +14,13 @@ from tokenizers import Tokenizer
 
 TOKENIZER_PATH = Path(__file__).parent / "tokenizer.json"
 
-SPECIALS = ["<|pad|>", "<|user|>", "<|assistant|>", "<|end|>"]
+# Mirrors SPECIALS in tokeniser.py — keep in sync.
+SPECIALS = [
+    "<|pad|>", "<|bos|>", "<|eos|>",
+    "<|user|>", "<|assistant|>", "<|endofturn|>",
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+    "<|text|>", "<|email|>", "<|py|>", "<|rs|>", "<|cpp|>",
+]
 
 
 @pytest.fixture(scope="module")
