@@ -53,6 +53,8 @@ class DPOConfig:
     max_tokens: int        = 512      # max tokens per (prompt+response)
     eval_every: int        = 50
     log_every:  int        = 10
+    # GQA: 0 = infer from checkpoint (or default to n_head for a new model)
+    n_kv_head:  int        = 0
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +126,40 @@ def dpo_loss(
 # ---------------------------------------------------------------------------
 
 
-def _build_nano() -> GPT:
-    cfg = ModelConfig(vocab_size=256, d_model=128, n_head=2, n_layer=2, ctx=64)
+def _infer_n_head(sd: dict, d_model: int) -> int:
+    """
+    Infer n_head from the RoPE cosine buffer shape.
+
+    rope_cos has shape (max_seq_len, d_head // 2), so
+    d_head = 2 * rope_cos.shape[1]  →  n_head = d_model // d_head.
+    """
+    d_head = 2 * sd["blocks.0.attn.rope_cos"].shape[1]
+    return d_model // d_head
+
+
+def _infer_n_kv_head(sd: dict, n_head: int, d_model: int) -> int:
+    """
+    Infer n_kv_head from the qkv_proj weight shape in a state dict.
+
+    qkv_proj.weight has shape (q_dim + 2*kv_dim, d_model) where
+    q_dim = n_head * d_head and kv_dim = n_kv_head * d_head.
+
+    Solving: n_kv_head = (out_features / d_head - n_head) / 2
+    """
+    d_head     = d_model // n_head
+    out_feats  = sd["blocks.0.attn.qkv_proj.weight"].shape[0]
+    n_kv_head  = (out_feats // d_head - n_head) // 2
+    return n_kv_head
+
+
+def _build_nano(n_kv_head: int = 0) -> GPT:
+    cfg = ModelConfig(vocab_size=256, d_model=128, n_head=2, n_layer=2,
+                      ctx=64, n_kv_head=n_kv_head)
     return GPT(cfg)
 
 
 def _load_model(ckpt_path: str | None, ctx: int,
-                device: torch.device) -> GPT:
+                device: torch.device, n_kv_head: int = 0) -> GPT:
     if ckpt_path and Path(ckpt_path).exists():
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
         sd    = state.get("model_state_dict", state.get("model", state))
@@ -138,14 +167,20 @@ def _load_model(ckpt_path: str | None, ctx: int,
         d_model    = sd["embed.weight"].shape[1]
         n_layer    = max(int(k.split(".")[1])
                          for k in sd if k.startswith("blocks.")) + 1
+        n_head     = _infer_n_head(sd, d_model)
+        # Infer GQA config from the qkv_proj shape so GQA checkpoints load correctly
+        inferred_kv = _infer_n_kv_head(sd, n_head, d_model)
+        resolved_kv = n_kv_head if n_kv_head > 0 else inferred_kv
         cfg   = ModelConfig(vocab_size=vocab_size, d_model=d_model,
-                            n_head=6, n_layer=n_layer, ctx=ctx)
+                            n_head=n_head, n_kv_head=resolved_kv,
+                            n_layer=n_layer, ctx=ctx)
         model = GPT(cfg)
         model.load_state_dict(sd, strict=True)
+        gqa_str = f"GQA n_kv={resolved_kv}" if resolved_kv != n_head else "MHA"
         print(f"[dpo] Loaded {Path(ckpt_path).name} — "
-              f"{model.num_params()/1e6:.1f}M params")
+              f"{model.num_params()/1e6:.1f}M params  {gqa_str}")
     else:
-        model = _build_nano()
+        model = _build_nano(n_kv_head)
         print("[dpo] No checkpoint — random nano model")
     return model.to(device)
 
@@ -171,7 +206,7 @@ def train(cfg: DPOConfig) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load reference model (frozen) and policy (trained) ──────────────────
-    ref_model = _load_model(cfg.ref_ckpt, cfg.ctx, device)
+    ref_model = _load_model(cfg.ref_ckpt, cfg.ctx, device, cfg.n_kv_head)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad_(False)
@@ -352,6 +387,8 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-steps",    type=int,   default=200)
     p.add_argument("--batch-size", type=int,   default=4)
     p.add_argument("--eval-every", type=int,   default=50)
+    p.add_argument("--n-kv-head", type=int,   default=0,
+                   help="GQA KV heads (0=infer from ckpt or use n_head)")
     return p.parse_args()
 
 
@@ -366,5 +403,6 @@ if __name__ == "__main__":
         n_steps    = args.n_steps,
         batch_size = args.batch_size,
         eval_every = args.eval_every,
+        n_kv_head  = args.n_kv_head,
     )
     train(cfg)

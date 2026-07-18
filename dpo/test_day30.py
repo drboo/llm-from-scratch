@@ -24,7 +24,10 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from model.gpt import GPT, ModelConfig
-from train.dpo import sequence_logprobs, dpo_loss, DPOConfig, _eval
+from train.dpo import (
+    sequence_logprobs, dpo_loss, DPOConfig, _eval,
+    _infer_n_head, _infer_n_kv_head, _build_nano, _load_model,
+)
 from dpo.data import (
     PREFERENCE_PAIRS,
     TRAIN_PAIRS,
@@ -43,6 +46,14 @@ from dpo.data import (
 def _nano() -> GPT:
     torch.manual_seed(0)
     cfg = ModelConfig(vocab_size=256, d_model=64, n_head=2, n_layer=2, ctx=64)
+    return GPT(cfg).eval()
+
+
+def _nano_gqa(n_kv_head: int = 1) -> GPT:
+    """Nano model with GQA (n_head=2, n_kv_head=1 = MQA by default)."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(vocab_size=256, d_model=64, n_head=2,
+                      n_kv_head=n_kv_head, n_layer=2, ctx=64)
     return GPT(cfg).eval()
 
 
@@ -421,3 +432,154 @@ class TestDPOTrainingDynamics:
         assert last_mean < first_mean, (
             f"Loss did not decrease: first={first_mean:.4f} last={last_mean:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Day 29 × Day 30: DPO on GQA models
+# ---------------------------------------------------------------------------
+
+
+class TestDPOWithGQA:
+    """GQA models (Day 29) must work end-to-end with DPO (Day 30)."""
+
+    def test_sequence_logprobs_gqa(self):
+        """sequence_logprobs must work on a GQA model."""
+        model = _nano_gqa(n_kv_head=1)
+        ids, labels = _ids_labels()
+        lp = sequence_logprobs(model, ids, labels)
+        assert lp.shape == ()
+        assert lp.item() <= 0.0
+
+    def test_dpo_loss_gqa_gradient_flows(self):
+        """Gradients from DPO loss must flow through a GQA policy."""
+        model = _nano_gqa(n_kv_head=1)
+        model.train()
+        ids, labels = _ids_labels()
+        ids2, labels2 = _ids_labels(prompt_len=3, response_len=7)
+
+        pol_c = sequence_logprobs(model, ids,  labels)
+        pol_r = sequence_logprobs(model, ids2, labels2)
+
+        with torch.no_grad():
+            ref_c = sequence_logprobs(_nano_gqa(), ids,  labels)
+            ref_r = sequence_logprobs(_nano_gqa(), ids2, labels2)
+
+        loss, _ = dpo_loss(pol_c.unsqueeze(0), pol_r.unsqueeze(0),
+                           ref_c.unsqueeze(0), ref_r.unsqueeze(0), beta=0.1)
+        loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert len(grads) > 0
+
+    def test_gqa_ref_frozen(self):
+        """Reference GQA model must not change during a policy update."""
+        device    = torch.device("cpu")
+        ref_model = _nano_gqa().to(device)
+        policy    = copy.deepcopy(ref_model)
+        policy.train()
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+        ref_params_before = [p.clone() for p in ref_model.parameters()]
+
+        ids, labels   = _ids_labels()
+        ids2, labels2 = _ids_labels(prompt_len=3, response_len=7)
+        ids   = ids.to(device);   labels   = labels.to(device)
+        ids2  = ids2.to(device);  labels2  = labels2.to(device)
+
+        with torch.no_grad():
+            ref_c = sequence_logprobs(ref_model, ids,  labels)
+            ref_r = sequence_logprobs(ref_model, ids2, labels2)
+        pol_c = sequence_logprobs(policy, ids,  labels)
+        pol_r = sequence_logprobs(policy, ids2, labels2)
+        loss, _ = dpo_loss(pol_c.unsqueeze(0), pol_r.unsqueeze(0),
+                           ref_c.unsqueeze(0), ref_r.unsqueeze(0), beta=0.1)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        for before, after in zip(ref_params_before, ref_model.parameters()):
+            assert torch.equal(before, after), "GQA ref model was modified!"
+
+    def test_infer_n_head_mha(self):
+        """_infer_n_head recovers n_head from MHA rope buffer."""
+        model = _nano()   # n_head=2, d_model=64
+        sd    = model.state_dict()
+        assert _infer_n_head(sd, d_model=64) == 2
+
+    def test_infer_n_head_gqa(self):
+        """_infer_n_head recovers n_head from GQA model (same rope, n_head unchanged)."""
+        model = _nano_gqa(n_kv_head=1)   # n_head=2, n_kv_head=1
+        sd    = model.state_dict()
+        assert _infer_n_head(sd, d_model=64) == 2
+
+    def test_infer_n_kv_head_mha(self):
+        """_infer_n_kv_head returns n_head for a standard MHA model."""
+        model = _nano()   # MHA: n_head=2, n_kv_head=0 → kv_heads=2
+        sd    = model.state_dict()
+        inferred = _infer_n_kv_head(sd, n_head=2, d_model=64)
+        assert inferred == 2
+
+    def test_infer_n_kv_head_gqa(self):
+        """_infer_n_kv_head correctly recovers n_kv_head from GQA state dict."""
+        model = _nano_gqa(n_kv_head=1)   # MQA
+        sd    = model.state_dict()
+        inferred = _infer_n_kv_head(sd, n_head=2, d_model=64)
+        assert inferred == 1
+
+    def test_load_model_gqa_from_tempfile(self, tmp_path):
+        """_load_model must reconstruct a GQA model from a saved checkpoint."""
+        model = _nano_gqa(n_kv_head=1)
+        ckpt_path = tmp_path / "gqa.pt"
+        torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+
+        loaded = _load_model(str(ckpt_path), ctx=64, device=torch.device("cpu"))
+        assert loaded.cfg.kv_heads == 1
+        assert isinstance(loaded, GPT)
+
+    def test_gqa_implicit_reward_positive_after_training(self):
+        """Implicit reward margin should be positive after DPO on a GQA model."""
+        device    = torch.device("cpu")
+        ref_model = _nano_gqa(n_kv_head=1).to(device)
+        policy    = copy.deepcopy(ref_model)
+        policy.train()
+        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-3)
+
+        torch.manual_seed(0)
+        c_ids, c_lab = _ids_labels(prompt_len=4, response_len=8)
+        torch.manual_seed(99)
+        r_ids, r_lab = _ids_labels(prompt_len=4, response_len=6)
+        c_ids = c_ids.to(device); c_lab = c_lab.to(device)
+        r_ids = r_ids.to(device); r_lab = r_lab.to(device)
+
+        for _ in range(30):
+            with torch.no_grad():
+                ref_c = sequence_logprobs(ref_model, c_ids, c_lab)
+                ref_r = sequence_logprobs(ref_model, r_ids, r_lab)
+            pol_c = sequence_logprobs(policy, c_ids, c_lab)
+            pol_r = sequence_logprobs(policy, r_ids, r_lab)
+            loss, _ = dpo_loss(pol_c.unsqueeze(0), pol_r.unsqueeze(0),
+                               ref_c.unsqueeze(0), ref_r.unsqueeze(0), beta=0.1)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        policy.eval()
+        with torch.no_grad():
+            rc  = sequence_logprobs(ref_model, c_ids, c_lab).item()
+            rr  = sequence_logprobs(ref_model, r_ids, r_lab).item()
+            pc  = sequence_logprobs(policy,    c_ids, c_lab).item()
+            pr  = sequence_logprobs(policy,    r_ids, r_lab).item()
+
+        assert (pc - rc) > (pr - rr), (
+            f"GQA implicit reward: chosen={pc-rc:.4f} rejected={pr-rr:.4f}"
+        )
+
+    def test_gqa_kv_cache_smaller_during_dpo_inference(self):
+        """GQA model has smaller KV cache than MHA for DPO generation."""
+        from model.kv_cache import KVCache
+        mha = _nano()
+        gqa = _nano_gqa(n_kv_head=1)
+        cache_mha = KVCache.for_model(mha, max_seq_len=64, device=torch.device("cpu"))
+        cache_gqa = KVCache.for_model(gqa, max_seq_len=64, device=torch.device("cpu"))
+        mha_kv_bytes = cache_mha.k[0].numel() * cache_mha.k[0].element_size()
+        gqa_kv_bytes = cache_gqa.k[0].numel() * cache_gqa.k[0].element_size()
+        assert gqa_kv_bytes < mha_kv_bytes
