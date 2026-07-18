@@ -1,0 +1,23 @@
+# Core ML
+torch==2.13.0
+numpy==2.5.1
+
+# Tokenizer
+tokenizers==0.23.1
+
+# Data pipeline
+datasets==5.0.0
+huggingface_hub==1.24.0
+tqdm==4.69.0
+
+# Inference server
+fastapi==0.139.2
+uvicorn==0.51.0
+pydantic==2.13.4
+httpx==0.28.1
+
+# Config
+PyYAML==6.0.3
+
+# Tests
+pytest==9.1.1
