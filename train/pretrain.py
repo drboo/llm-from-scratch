@@ -161,15 +161,30 @@ def eval_loss(model: GPT, cfg: TrainConfig, device: torch.device) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _save_sample(model: GPT, cfg: TrainConfig, step: int, device: torch.device) -> None:
+def _load_codec(cfg: TrainConfig):
+    """Return a Codec for BPE models, or None for byte-level models."""
+    if cfg.vocab_size <= 256:
+        return None
+    tok_path = ROOT / "tokeniser" / "tokenizer.json"
+    if not tok_path.exists():
+        return None
+    try:
+        sys.path.insert(0, str(ROOT / "tokeniser"))
+        from tokenizer import Codec  # type: ignore
+        return Codec(str(tok_path))
+    except Exception:
+        return None
+
+
+def _save_sample(model: GPT, cfg: TrainConfig, step: int, device: torch.device,
+                 codec=None) -> None:
     """Generate from cfg.sample_prompt and write to out_dir/samples/step_XXXXXX.txt."""
-    prompt_ids = torch.tensor(
-        [b for b in cfg.sample_prompt.encode("utf-8")],
-        dtype=torch.long, device=device,
-    ).unsqueeze(0)
-    # Clamp to vocab — byte encoding valid for vocab≥256; for BPE models use codec
-    if prompt_ids.max().item() >= cfg.vocab_size:
-        prompt_ids = prompt_ids % cfg.vocab_size
+    if codec is not None:
+        ids = codec.encode(cfg.sample_prompt)
+    else:
+        ids = list(cfg.sample_prompt.encode("utf-8"))
+
+    prompt_ids = torch.tensor([ids], dtype=torch.long, device=device)
 
     out = generate_sample(
         model, prompt_ids,
@@ -178,10 +193,13 @@ def _save_sample(model: GPT, cfg: TrainConfig, step: int, device: torch.device) 
         top_k=cfg.sample_top_k,
     )
     new_ids = out[0, prompt_ids.shape[1]:].tolist()
-    try:
-        text = bytes([i for i in new_ids if i < 256]).decode("utf-8", errors="replace")
-    except Exception:
-        text = str(new_ids)
+    if codec is not None:
+        text = codec.decode(new_ids)
+    else:
+        try:
+            text = bytes([i for i in new_ids if i < 256]).decode("utf-8", errors="replace")
+        except Exception:
+            text = str(new_ids)
 
     samples_dir = Path(cfg.out_dir) / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -216,6 +234,11 @@ def train(cfg: TrainConfig) -> None:
     print(f"tokens/step: {tps:,}  "
           f"(batch={cfg.batch_size} × ctx={cfg.ctx} × accum={cfg.accum_steps})")
     print(f"device     : {device}")
+
+    # ── Codec (for BPE sample decoding) ─────────────────────────────────────
+    codec = _load_codec(cfg) if cfg.sample_prompt else None
+    if codec:
+        print(f"[sample] BPE codec loaded (vocab={codec.vocab_size})")
 
     # ── W&B ─────────────────────────────────────────────────────────────────
     wb = None
@@ -286,7 +309,7 @@ def train(cfg: TrainConfig) -> None:
         # ── Sample progression ────────────────────────────────────────────────
         sample_every = cfg.sample_steps if cfg.sample_steps > 0 else cfg.ckpt_every
         if cfg.sample_prompt and step % sample_every == 0:
-            _save_sample(model, cfg, step, device)
+            _save_sample(model, cfg, step, device, codec=codec)
 
     if wb:
         wb.finish()
