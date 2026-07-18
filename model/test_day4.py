@@ -1,3 +1,4 @@
+
 """
 Day 4 checkpoint tests.
 

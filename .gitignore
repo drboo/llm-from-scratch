@@ -1,6 +1,10 @@
 # Generated / large artifacts — track code, ignore binary data
 data/toy/
 data/*.bin
+data/raw_shards/
+data/clean_shards/
+data/dedup_shards/
+data/real/
 checkpoints/
 *.pt
 *.safetensors
