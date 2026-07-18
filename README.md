@@ -58,6 +58,27 @@ Logits  (B, T, vocab_size)
 | Weight tying (head = embed^T) | Saves `vocab × d_model` params, enforces consistency between token input/output spaces |
 | Scaled residual init | `out_proj` and `w_down` at `std = 0.02 / √(2N)` keeps residual stream variance ~1 at init regardless of depth |
 | Fused QKV projection | Single `Linear(d, 3d)` vs three separate — one GEMM, better GPU utilization |
+| GQA (optional) | K and V use fewer heads than Q — reduces KV cache memory proportionally with no change to forward math |
+
+### Grouped Query Attention (GQA)
+
+`CausalSelfAttention` supports three attention modes via `ModelConfig.n_kv_head`:
+
+| Mode | `n_kv_head` | KV cache vs MHA | Used by |
+|------|-------------|-----------------|---------|
+| MHA (default) | `0` or `n_head` | 1× | GPT-2, this build by default |
+| GQA | `1 < n_kv_head < n_head` | `n_kv_head / n_head` | LLaMA-2-70B (8 KV / 64 Q heads) |
+| MQA | `1` | `1 / n_head` | PaLM, Falcon |
+
+The fused QKV projection becomes `Linear(d_model, (n_head + 2·n_kv_head)·d_head)` — Q keeps `n_head` channels, K and V each use `n_kv_head`. Before `scaled_dot_product_attention`, the KV heads are expanded via `repeat_interleave` to match Q. The KV cache allocates `(1, n_kv_head, max_seq_len, d_head)` per layer instead of `(1, n_head, …)`, giving a direct memory saving.
+
+```python
+# Example: 3× smaller KV cache
+cfg = ModelConfig(n_head=6, n_kv_head=2, d_model=384, ...)
+model = GPT(cfg)
+```
+
+`n_head` and `n_kv_head` are both inferred automatically when loading a checkpoint — no flags needed.
 
 ---
 
@@ -138,6 +159,30 @@ Build SFT dataset:
 ```bash
 python -c "from sft.data import build_sft_dataset; build_sft_dataset('data/sft')"
 ```
+
+### DPO (Direct Preference Optimization)
+
+DPO (Rafailov et al. 2023) aligns the model with human preferences without a reward model. Starting from a frozen SFT reference, it trains a policy to prefer chosen responses over rejected ones using the loss:
+
+```
+L_DPO = −E [ log σ( β · (log π/π_ref|chosen − log π/π_ref|rejected) ) ]
+```
+
+The implicit reward for a response is `β · (log π(y|x) − log π_ref(y|x))`. After training, `r_chosen > r_rejected` — the policy assigns more probability to preferred completions relative to the reference.
+
+```bash
+python train/dpo.py \
+    --ref-ckpt checkpoints/sft/ckpt_best.pt \
+    --out-dir  checkpoints/dpo \
+    --beta 0.1 --lr 5e-7 --n-steps 500
+```
+
+DPO details:
+- Preference data: 40 hand-written pairs (20 professional email, 20 Python code) with quality-demonstrating chosen vs. terse/buggy rejected responses (`dpo/data.py`)
+- Loss masking: identical to SFT — `-100` on prompt tokens so only response tokens contribute to `sequence_logprobs`
+- Reference model is deep-copied from the SFT checkpoint and frozen (`requires_grad=False`) for the entire run
+- `β=0.1` controls how far the policy can deviate from the reference; lower = stays closer to SFT
+- Works with GQA checkpoints: `n_head` and `n_kv_head` are inferred automatically from the state dict
 
 ---
 
@@ -273,14 +318,20 @@ python train/pretrain.py \
 python -c "from sft.data import build_sft_dataset; build_sft_dataset('data/sft')"
 python train/sft.py --base-ckpt checkpoints/ckpt_050000.pt --data-dir data/sft
 
-# 5. Evaluate
+# 5. DPO alignment (optional — fine-tunes the SFT model on preference pairs)
+python train/dpo.py \
+    --ref-ckpt checkpoints/sft/ckpt_best.pt \
+    --out-dir  checkpoints/dpo \
+    --beta 0.1 --lr 5e-7 --n-steps 500
+
+# 6. Evaluate
 python eval/full_eval.py \
     --base-ckpt checkpoints/ckpt_050000.pt \
     --sft-ckpt  checkpoints/sft/ckpt_best.pt \
     --out-dir   eval/results
 
-# 6. Serve
-python inference/serve.py --ckpt checkpoints/sft/ckpt_best.pt
+# 7. Serve
+python inference/serve.py --ckpt checkpoints/dpo/ckpt_best.pt
 ```
 
 For a quick smoke test on CPU (no GPU, no data download):
@@ -294,8 +345,8 @@ python -m pytest model/ train/ inference/ eval/ sft/ data/ -v  # full test suite
 ## Tests
 
 ```bash
-# All tests (no network, ~20s on CPU):
-python -m pytest model/ train/ inference/ eval/ sft/ data/ -v
+# All tests (no network, ~25s on CPU):
+python -m pytest model/ train/ inference/ eval/ sft/ data/ dpo/ -v
 
 # Tokenizer tests (requires tokenizer.json):
 python -m pytest tokeniser/ -v
@@ -328,6 +379,8 @@ python -m pytest eval/test_day24.py::TestCanonicalSolutions -v
 | 25 | `eval/test_day25.py` | 27 |
 | 26 | `model/test_day26.py` | 17 |
 | 27 | `inference/test_day27.py` | 22 |
+| 29 | `model/test_day29.py` | 25 |
+| 30 | `dpo/test_day30.py` | 36 |
 
 ---
 
@@ -364,6 +417,8 @@ python -m pytest eval/test_day24.py::TestCanonicalSolutions -v
 │   ├── block.py                  # TransformerBlock (forward + forward_cached)
 │   ├── gpt.py                    # GPT model (forward + generate_cached)
 │   └── kv_cache.py               # KVCache — pre-allocated K/V tensors
+├── dpo/
+│   └── data.py                   # 40 hand-written preference pairs + encoder
 ├── sft/
 │   └── data.py                   # SFT dataset builder (Alpaca + OASST + hand-written)
 ├── tokeniser/
@@ -373,7 +428,8 @@ python -m pytest eval/test_day24.py::TestCanonicalSolutions -v
     ├── checkpoint.py             # save/load with full RNG state
     ├── overfit.py                # single-batch sanity check
     ├── pretrain.py               # production pretraining loop
-    └── sft.py                    # SFT loop with loss masking + early stopping
+    ├── sft.py                    # SFT loop with loss masking + early stopping
+    └── dpo.py                    # DPO loop (frozen ref + policy, β-scaled margin loss)
 ```
 
 ---
@@ -383,7 +439,7 @@ python -m pytest eval/test_day24.py::TestCanonicalSolutions -v
 - **Scale**: the nano model (22.9M params, ctx=256) demonstrates all the mechanics correctly but sits well below the quality threshold for useful text generation. Chinchilla-optimal training would require ~460M tokens; the current corpus is closer to 10M for the toy run.
 - **HumanEval pass@k**: expect ~0% pass@1 at nano scale on zero-shot HumanEval. The infrastructure (sandbox, unbiased estimator) is the deliverable; real numbers require at least a GPT-2-small-scale model.
 - **SFT data size**: 35k examples is enough to see the chat template applied correctly and refusal behavior disappear, but not enough for robust instruction following.
-- **No RLHF/DPO**: the SFT model has no preference alignment; it can generate harmful content. This is a research prototype.
+- **DPO data size**: 40 hand-written preference pairs demonstrates the mechanics (gradient sign, implicit reward direction, ref model frozen) but is far too small for meaningful alignment. A production run needs thousands of diverse pairs from a human labelling pipeline or a stronger teacher model.
 - **Tokenizer training corpus**: the BPE tokenizer was trained on a small sample; fertility (tokens per word) is higher than production tokenizers like GPT-4's cl100k.
 - **ctx=256**: short context window means the model cannot handle most real documents. Increasing to 1024+ requires proportionally more memory and is a straightforward config change.
 
@@ -406,3 +462,9 @@ python -m pytest eval/test_day24.py::TestCanonicalSolutions -v
 - **SFT data quality > quantity**: the hand-written examples (30 prompts) were more impactful per example than streaming thousands of Alpaca completions that include refusals, which train the model to say "I cannot."
 
 - **Data pipeline is the slow path**: the model trains in hours; building, cleaning, and deduplicating a diverse corpus of millions of documents took more engineering time than the model itself.
+
+- **GQA saves memory, not compute**: with `n_kv_head=2` and `n_head=6`, the KV cache shrinks 3×, enabling a larger batch or longer context at the same memory budget. On a tiny CPU model the wall-clock speedup is negligible because the bottleneck is matrix multiply, not memory bandwidth. On GPU at ctx ≥ 512 the bandwidth saving becomes the dominant effect.
+
+- **DPO's β is the only real knob**: too high (≥ 1.0) and the policy barely moves; too low (≤ 0.01) and it drifts far from the reference and collapses. The sweet spot for a small model on a small preference set is typically 0.05–0.2. The implicit reward margin sign is the clearest training signal — a positive margin for chosen vs. rejected means the update is going in the right direction.
+
+- **Reference model identity is everything in DPO**: the reference and policy must start from identical weights (deep copy, not re-load from disk) or you get a spurious constant offset in the log-ratio that corrupts the loss. The test `test_ref_model_frozen_during_training` catches this class of bug before it silently degrades training.
