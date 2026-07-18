@@ -30,3 +30,14 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x
+
+    def forward_cached(
+        self,
+        x:        torch.Tensor,
+        start_pos: int,
+        k_cache:  torch.Tensor,
+        v_cache:  torch.Tensor,
+    ) -> torch.Tensor:
+        x = x + self.attn.forward_cached(self.norm1(x), start_pos, k_cache, v_cache)
+        x = x + self.ffn(self.norm2(x))
+        return x

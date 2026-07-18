@@ -95,3 +95,58 @@ class CausalSelfAttention(nn.Module):
         # Merge heads: (B, H, T, d_head) → (B, T, d_model)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.out_proj(out)
+
+    def forward_cached(
+        self,
+        x:       torch.Tensor,
+        start_pos: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Cached forward for autoregressive generation.
+
+        Args:
+            x:         (1, T, d_model)  T=prompt_len on prefill, T=1 on decode
+            start_pos: absolute position of the first token in x
+            k_cache:   (1, n_head, max_seq_len, d_head)  — mutated in-place
+            v_cache:   (1, n_head, max_seq_len, d_head)  — mutated in-place
+
+        Returns:
+            (1, T, d_model)
+
+        RoPE correctness: Q and the new K are both rotated by the *absolute*
+        positions [start_pos, start_pos+T), so cached K values from earlier
+        steps (already rotated by their own positions) combine correctly.
+        """
+        B, T, _ = x.shape
+
+        qkv = self.qkv_proj(x)
+        Q, K, V = qkv.split(self.d_model, dim=-1)
+
+        Q = self._split_heads(Q, B, T)   # (1, H, T, d_head)
+        K = self._split_heads(K, B, T)
+        V = self._split_heads(V, B, T)
+
+        # RoPE using ABSOLUTE positions — critical for correctness
+        cos = self.rope_cos[start_pos : start_pos + T]
+        sin = self.rope_sin[start_pos : start_pos + T]
+        Q = apply_rope(Q, cos, sin)
+        K = apply_rope(K, cos, sin)
+
+        # Write new K, V into the cache at the right positions
+        k_cache[:, :, start_pos : start_pos + T, :] = K
+        v_cache[:, :, start_pos : start_pos + T, :] = V
+
+        # Attend over the full filled context [0, start_pos + T)
+        K_ctx = k_cache[:, :, : start_pos + T, :]
+        V_ctx = v_cache[:, :, : start_pos + T, :]
+
+        # Prefill (T > 1) needs causal mask; decode (T == 1) does not
+        # (single query is the last position — nothing to mask)
+        out = F.scaled_dot_product_attention(
+            Q, K_ctx, V_ctx, is_causal=(T > 1)
+        )
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.out_proj(out)

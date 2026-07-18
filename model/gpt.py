@@ -127,3 +127,106 @@ class GPT(nn.Module):
                 targets.reshape(-1),
             )
         return logits, loss
+
+    # ------------------------------------------------------------------
+    # Cached generation (Day 26)
+    # ------------------------------------------------------------------
+
+    def forward_cached(
+        self,
+        idx:       torch.Tensor,
+        start_pos: int,
+        cache,
+    ) -> torch.Tensor:
+        """
+        Single forward pass using the KV cache.
+
+        Args:
+            idx:       (1, T) token ids — T=prompt_len on prefill, T=1 on decode
+            start_pos: absolute sequence position of the first token in idx
+            cache:     KVCache instance (mutated in-place)
+
+        Returns:
+            logits (1, T, vocab_size)
+        """
+        x = self.embed(idx)
+        for i, block in enumerate(self.blocks):
+            x = block.forward_cached(x, start_pos, cache.k[i], cache.v[i])
+        x = self.norm(x)
+        return self.head(x)
+
+    @torch.no_grad()
+    def generate_cached(
+        self,
+        prompt_ids:  torch.Tensor,
+        n_new:       int,
+        temperature: float = 1.0,
+        top_k:       int | None = None,
+        top_p:       float | None = None,
+        eos_id:      int | None = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation with KV cache.
+
+        Prefills the prompt in a single pass, then decodes one token at a
+        time.  Each decode step runs only one token through the network;
+        previous K/V are read from the cache.
+
+        Args:
+            prompt_ids: (1, T) int64
+            n_new:      maximum new tokens to generate
+            temperature: > 0; 0 = greedy
+            top_k:      top-k filtering (None = disabled)
+            top_p:      nucleus filtering (None = disabled)
+            eos_id:     stop early if this token is sampled
+
+        Returns:
+            (1, T + n_generated) token ids
+        """
+        from model.kv_cache import KVCache
+        from inference.sample import top_k_filter, top_p_filter
+
+        device    = prompt_ids.device
+        prompt_len = prompt_ids.shape[1]
+        max_len   = prompt_len + n_new
+
+        cache = KVCache.for_model(self, max_len, device,
+                                   dtype=next(self.parameters()).dtype)
+
+        # ── Prefill ─────────────────────────────────────────────────────
+        logits = self.forward_cached(prompt_ids, start_pos=0, cache=cache)
+        # logits: (1, prompt_len, vocab_size)
+
+        generated: list[int] = []
+        next_logits = logits[:, -1, :]   # (1, vocab_size)
+
+        # ── Decode loop ─────────────────────────────────────────────────
+        for step in range(n_new):
+            # Sample from next_logits
+            if temperature == 0.0:
+                next_id = next_logits.argmax(dim=-1, keepdim=True)  # (1, 1)
+            else:
+                scaled = next_logits / temperature
+                if top_k is not None:
+                    scaled = top_k_filter(scaled, top_k)
+                if top_p is not None:
+                    scaled = top_p_filter(scaled, top_p)
+                probs   = F.softmax(scaled, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)   # (1, 1)
+
+            tok = next_id.item()
+            generated.append(tok)
+
+            if eos_id is not None and tok == eos_id:
+                break
+
+            if prompt_len + step + 1 >= max_len:
+                break
+
+            # Feed the new token back
+            pos     = prompt_len + step
+            logits  = self.forward_cached(next_id, start_pos=pos, cache=cache)
+            next_logits = logits[:, -1, :]
+
+        gen_tensor = torch.tensor([generated], dtype=torch.long, device=device)
+        return torch.cat([prompt_ids, gen_tensor], dim=1)
