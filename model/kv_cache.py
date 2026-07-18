@@ -43,10 +43,14 @@ class KVCache:
         device:      torch.device,
         dtype:       torch.dtype = torch.float32,
     ) -> "KVCache":
-        """Convenience constructor that reads shape from a GPT model."""
-        cfg   = model.cfg
+        """Convenience constructor that reads shape from a GPT model.
+
+        With GQA, the cache uses n_kv_head rather than n_head so it is
+        proportionally smaller (e.g. 3× smaller when n_head=6, n_kv_head=2).
+        """
+        cfg    = model.cfg
         d_head = cfg.d_model // cfg.n_head
-        return cls(cfg.n_layer, cfg.n_head, d_head, max_seq_len, device, dtype)
+        return cls(cfg.n_layer, cfg.kv_heads, d_head, max_seq_len, device, dtype)
 
     def reset(self) -> None:
         """Zero out the cache (call between independent generation requests)."""

@@ -29,6 +29,14 @@ class ModelConfig:
     n_head:     int = 6
     n_layer:    int = 6
     ctx:        int = 256
+    # GQA: number of KV heads. 0 means n_head (standard MHA).
+    # Must divide n_head evenly. 1 = MQA, n_head = MHA.
+    n_kv_head:  int = 0
+
+    @property
+    def kv_heads(self) -> int:
+        """Resolved number of KV heads (never 0)."""
+        return self.n_kv_head if self.n_kv_head > 0 else self.n_head
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ModelConfig:
@@ -54,7 +62,8 @@ class GPT(nn.Module):
 
         self.embed  = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_head, max_seq_len=cfg.ctx)
+            TransformerBlock(cfg.d_model, cfg.n_head,
+                             n_kv_head=cfg.kv_heads, max_seq_len=cfg.ctx)
             for _ in range(cfg.n_layer)
         ])
         self.norm   = RMSNorm(cfg.d_model)

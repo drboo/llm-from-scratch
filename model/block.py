@@ -19,10 +19,11 @@ class TransformerBlock(nn.Module):
     even in deep stacks.
     """
 
-    def __init__(self, d_model: int, n_head: int, max_seq_len: int = 2048):
+    def __init__(self, d_model: int, n_head: int, n_kv_head: int = 0,
+                 max_seq_len: int = 2048):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn  = CausalSelfAttention(d_model, n_head, max_seq_len)
+        self.attn  = CausalSelfAttention(d_model, n_head, n_kv_head, max_seq_len)
         self.norm2 = RMSNorm(d_model)
         self.ffn   = SwiGLUFFN(d_model)
 
