@@ -65,14 +65,13 @@ def _iter_web(n: int):
 def _iter_email(n: int):
     """Stream n emails from the Enron spam dataset."""
     from datasets import load_dataset
-    ds = load_dataset("enron_spam", split="train", streaming=True, trust_remote_code=True)
+    ds = load_dataset("SetFit/enron_spam", split="train", streaming=True)
     count = 0
     for ex in ds:
         if count >= n:
             break
-        # Dataset has 'subject' and 'body' (or 'text') fields
         subject = ex.get("subject", "")
-        body    = ex.get("body", ex.get("text", ""))
+        body    = ex.get("message", ex.get("text", ""))
         if not body:
             continue
         text = f"Subject: {subject}\n\n{body}" if subject else body
@@ -113,7 +112,7 @@ def _iter_code(n: int):
         pass  # fall through to public fallback
 
     # Fallback: code_search_net (Python split)
-    ds = load_dataset("code_search_net", "python", split="train", streaming=True)
+    ds = load_dataset("code-search-net/code_search_net", "python", split="train", streaming=True)
     count = 0
     for ex in ds:
         if count >= n:
