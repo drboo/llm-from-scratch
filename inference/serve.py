@@ -42,11 +42,33 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from model.gpt import GPT, ModelConfig
+from model.rope import precompute_rope_freqs
 from inference.sample import top_k_filter, top_p_filter
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+
+
+def _infer_n_head(sd: dict, d_model: int) -> int:
+    d_head = 2 * sd["blocks.0.attn.rope_cos"].shape[1]
+    return d_model // d_head
+
+
+def _infer_n_kv_head(sd: dict, n_head: int, d_model: int) -> int:
+    d_head    = d_model // n_head
+    out_feats = sd["blocks.0.attn.qkv_proj.weight"].shape[0]
+    return (out_feats // d_head - n_head) // 2
+
+
+def _extend_rope_buffers(model: GPT, max_seq_len: int) -> None:
+    """Re-extend rope buffers beyond the trained ctx so long generations don't crash."""
+    for block in model.blocks:
+        attn = block.attn
+        if attn.rope_cos.shape[0] < max_seq_len:
+            cos, sin = precompute_rope_freqs(attn.d_head, max_seq_len)
+            attn.rope_cos = cos.to(device=attn.rope_cos.device, dtype=attn.rope_cos.dtype)
+            attn.rope_sin = sin.to(device=attn.rope_sin.device, dtype=attn.rope_sin.dtype)
 
 
 def _load_model(ckpt_path: str | None, ctx: int, device: torch.device) -> GPT:
@@ -56,19 +78,24 @@ def _load_model(ckpt_path: str | None, ctx: int, device: torch.device) -> GPT:
         vocab_size = sd["embed.weight"].shape[0]
         d_model    = sd["embed.weight"].shape[1]
         n_layer    = max(int(k.split(".")[1]) for k in sd if k.startswith("blocks.")) + 1
-        n_head     = 6
+        n_head     = _infer_n_head(sd, d_model)
+        n_kv_head  = _infer_n_kv_head(sd, n_head, d_model)
         cfg = ModelConfig(vocab_size=vocab_size, d_model=d_model,
-                          n_head=n_head, n_layer=n_layer, ctx=ctx)
+                          n_head=n_head, n_kv_head=n_kv_head,
+                          n_layer=n_layer, ctx=ctx)
         model = GPT(cfg)
         model.load_state_dict(sd, strict=True)
+        gqa_str = f"GQA n_kv={n_kv_head}" if n_kv_head != n_head else "MHA"
         print(f"[serve] Loaded {Path(ckpt_path).name} — "
-              f"{model.num_params()/1e6:.1f}M params", flush=True)
+              f"{model.num_params()/1e6:.1f}M params  {gqa_str}", flush=True)
     else:
         cfg   = ModelConfig()
         model = GPT(cfg)
         print("[serve] No checkpoint — using random-init nano model", flush=True)
 
     model.to(device).eval()
+    # Extend rope buffers so generations longer than the training ctx don't crash.
+    _extend_rope_buffers(model, max(cfg.ctx * 4, 2048))
     return model
 
 
