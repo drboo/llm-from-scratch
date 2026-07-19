@@ -159,7 +159,20 @@ class CausalSelfAttention(nn.Module):
 
         Q, K, V = self._project(x, B, T)
 
-        # RoPE with ABSOLUTE positions
+        # Chunked prefill (start_pos > 0 and T > 1) would need a bottom-right-
+        # aligned causal mask; only full prefill (start_pos=0) and single-token
+        # decode (T=1) are supported today.
+        assert start_pos == 0 or T == 1, (
+            "Cached forward only supports full prefill (start_pos=0) or "
+            "single-token decode (T=1). Chunked prefill is not implemented."
+        )
+
+        # RoPE with ABSOLUTE positions — assert bounds to catch rope-buffer overflow early.
+        rope_len = self.rope_cos.shape[0]
+        assert start_pos + T <= rope_len, (
+            f"Sequence position {start_pos + T} exceeds RoPE buffer size {rope_len}. "
+            "Extend rope buffers via _extend_rope_buffers() before long generations."
+        )
         cos = self.rope_cos[start_pos : start_pos + T]
         sin = self.rope_sin[start_pos : start_pos + T]
         Q = apply_rope(Q, cos, sin)
@@ -169,7 +182,9 @@ class CausalSelfAttention(nn.Module):
         k_cache[:, :, start_pos : start_pos + T, :] = K
         v_cache[:, :, start_pos : start_pos + T, :] = V
 
-        # Read full context from cache, then expand for GQA
+        # Read full context from cache, then expand for GQA.
+        # Note: repeat_interleave materialises n_head-sized copies on every
+        # decode step, partially offsetting the GQA cache-memory savings.
         K_ctx = k_cache[:, :, : start_pos + T, :]
         V_ctx = v_cache[:, :, : start_pos + T, :]
         K_ctx, V_ctx = self._expand_kv(K_ctx, V_ctx)

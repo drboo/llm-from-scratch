@@ -126,20 +126,24 @@ def _encode(text: str, codec, vocab_size: int, device: torch.device) -> torch.Te
     return torch.tensor([ids], dtype=torch.long, device=device)
 
 
-def _decode(ids: list[int], codec, vocab_size: int) -> str:
+def _decode(ids: list[int], codec, vocab_size: int,
+            skip_special_tokens: bool = False) -> str:
     if codec and vocab_size > 256:
-        return codec.decode(ids)
+        return codec.decode(ids, skip_special_tokens=skip_special_tokens)
     return bytes(i for i in ids if i < 256).decode("utf-8", errors="replace")
 
 
 def _encode_chat(instruction: str, codec, vocab_size: int,
                  device: torch.device) -> torch.Tensor:
-    """Encode just the prompt half of the chat template (no response yet)."""
-    if codec and hasattr(codec, "encode_chat") and vocab_size > 256:
-        ids, _ = codec.encode_chat(instruction, "")
-        # Keep only the prompt portion (up to and including <|assistant|>)
-        text = f"<|bos|><|user|>{instruction}<|endofturn|><|assistant|>"
-        ids  = codec.encode(text)
+    """Encode just the prompt half of the chat template (no response yet).
+
+    Uses the same token assembly as Codec.encode_chat to guarantee the prompt
+    and response sides are always consistent.
+    """
+    if codec and vocab_size > 256:
+        # Mirror the head built by codec.encode_chat so token ids are identical.
+        ids = [codec.bos, codec.user, *codec.encode(instruction),
+               codec.endofturn, codec.assistant]
     else:
         text = f"<|bos|><|user|>{instruction}<|endofturn|><|assistant|>"
         ids  = list(text.encode("utf-8"))
@@ -251,11 +255,13 @@ def build_app(model: GPT, codec, device: torch.device):
     @app.post("/generate", response_model=GenerateResponse)
     def generate(req: GenerateRequest = Body(...)):
         prompt_ids = _encode(req.prompt, codec, model.cfg.vocab_size, device)
+        eos_id     = codec.eos if codec and model.cfg.vocab_size > 256 else None
         new_ids    = generate_tokens(
             model, prompt_ids, req.max_tokens,
             req.temperature, req.top_k, req.top_p,
+            eos_id=eos_id,
         )
-        text = _decode(new_ids, codec, model.cfg.vocab_size)
+        text = _decode(new_ids, codec, model.cfg.vocab_size, skip_special_tokens=True)
         return GenerateResponse(text=text, tokens_generated=len(new_ids))
 
     @app.get("/generate/stream")
@@ -266,14 +272,27 @@ def build_app(model: GPT, codec, device: torch.device):
         top_k:       int   = Query(default=0,   ge=0),
         top_p:       float = Query(default=1.0, ge=0.0, le=1.0),
     ):
-        """Server-sent events stream — each event is one token as JSON."""
+        """Server-sent events stream — each event is one decoded text piece as JSON.
+
+        Decodes the full accumulated token list each step and emits only the new
+        suffix, which correctly handles multi-byte UTF-8 characters that span
+        multiple BPE tokens.
+        """
         prompt_ids = _encode(prompt, codec, model.cfg.vocab_size, device)
+        eos_id     = codec.eos if codec and model.cfg.vocab_size > 256 else None
 
         def event_stream():
+            accumulated = []
+            prev_text   = ""
             for tok_id in _iter_tokens(model, prompt_ids, max_tokens,
-                                       temperature, top_k, top_p, eos_id=None):
-                token_text = _decode([tok_id], codec, model.cfg.vocab_size)
-                yield f"data: {json.dumps({'token': token_text})}\n\n"
+                                       temperature, top_k, top_p, eos_id=eos_id):
+                accumulated.append(tok_id)
+                full_text = _decode(accumulated, codec, model.cfg.vocab_size,
+                                    skip_special_tokens=True)
+                new_piece = full_text[len(prev_text):]
+                prev_text = full_text
+                if new_piece:
+                    yield f"data: {json.dumps({'token': new_piece})}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -324,15 +343,20 @@ def chat_loop(model: GPT, codec, device: torch.device,
 
         print("Assistant: ", end="", flush=True)
         generated: list[int] = []
+        prev_text = ""
 
         for tok_id in _iter_tokens(model, prompt_ids, max_tokens,
                                    temperature, top_k, 1.0, eos_id):
             generated.append(tok_id)
-            piece = _decode([tok_id], codec, vocab_size)
-            # Stop if the decoded piece is a stop token
-            if piece in stop_tokens or (eos_id is not None and tok_id == eos_id):
+            # Decode the full accumulated sequence and emit only the new suffix.
+            # This correctly handles multi-byte UTF-8 characters.
+            full_text = _decode(generated, codec, vocab_size, skip_special_tokens=True)
+            new_piece = full_text[len(prev_text):]
+            prev_text = full_text
+            if tok_id == eos_id or (new_piece in stop_tokens):
                 break
-            print(piece, end="", flush=True)
+            if new_piece:
+                print(new_piece, end="", flush=True)
 
         print()   # newline after response
         print()

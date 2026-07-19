@@ -26,6 +26,7 @@ def save(
     torch.save(
         {
             "model":           model.state_dict(),
+            "model_cfg":       vars(model.cfg) if hasattr(model, "cfg") else None,
             "optimizer":       optimizer.state_dict(),
             "step":            step,
             "loss":            loss,

@@ -60,6 +60,7 @@ class SFTConfig:
     vocab_size: int = 32_000
     d_model:    int = 384
     n_head:     int = 6
+    n_kv_head:  int = 0       # 0 = MHA; set to < n_head for GQA
     n_layer:    int = 6
     ctx:        int = 256
 
@@ -99,6 +100,7 @@ class SFTConfig:
             vocab_size=self.vocab_size,
             d_model=self.d_model,
             n_head=self.n_head,
+            n_kv_head=self.n_kv_head,
             n_layer=self.n_layer,
             ctx=self.ctx,
         )
@@ -192,10 +194,14 @@ def get_lr(step: int, total_steps: int, cfg: SFTConfig) -> float:
 
 
 def sft_loss(logits: torch.Tensor, labels: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    """Cross-entropy loss ignoring -100 labels (prompt + padding tokens)."""
+    """Cross-entropy loss ignoring -100 labels (prompt + padding tokens).
+
+    logits[t] predicts the token at position t+1, so we shift: compare
+    logits[:, :-1] against labels[:, 1:] — standard next-token prediction.
+    """
     return F.cross_entropy(
-        logits.reshape(-1, vocab_size),
-        labels.reshape(-1),
+        logits[:, :-1, :].reshape(-1, vocab_size),
+        labels[:, 1:].reshape(-1),
         ignore_index=-100,
     )
 
@@ -227,8 +233,27 @@ def make_optimizer(model: GPT, cfg: SFTConfig) -> torch.optim.AdamW:
 def eval_loss(model: GPT, cfg: SFTConfig, device: torch.device) -> float:
     model.eval()
     losses = []
+    # Fixed seed makes val loss comparable across evals; early stopping is stable.
+    val_rng = np.random.RandomState(0)
+    offsets, tokens, labels = _load_split(Path(cfg.data_dir), "val")
+    n_examples = len(offsets) - 1
     for _ in range(cfg.eval_batches):
-        x, y = sft_get_batch("val", cfg.data_dir, cfg.ctx, cfg.batch_size, device)
+        idxs = val_rng.randint(0, n_examples, size=(cfg.batch_size,))
+        batch_x: list[list[int]] = []
+        batch_y: list[list[int]] = []
+        for i in idxs:
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            t = list(map(int, tokens[s:e]))[:cfg.ctx]
+            l = list(map(int, labels[s:e]))[:cfg.ctx]
+            batch_x.append(t)
+            batch_y.append(l)
+        max_len = max(len(t) for t in batch_x)
+        for i in range(cfg.batch_size):
+            pad = max_len - len(batch_x[i])
+            batch_x[i].extend([0] * pad)
+            batch_y[i].extend([-100] * pad)
+        x = torch.tensor(batch_x, dtype=torch.long,  device=device)
+        y = torch.tensor(batch_y, dtype=torch.long,  device=device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=device.type == "cuda"):
             logits, _ = model(x, targets=None)
@@ -280,26 +305,24 @@ def _sample_response(model: GPT, cfg: SFTConfig, device: torch.device) -> str:
 
 
 def _infer_model_config(ckpt_path: str) -> dict:
-    """Read model config from a pretrain checkpoint's state dict shapes."""
+    """Read model config from a checkpoint, using saved cfg or shape inference."""
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = state.get("model_state_dict", state)
-    # d_model from embed weight, n_layer from block count, n_head from attn
-    d_model   = sd["embed.weight"].shape[1]
+
+    # Prefer the config saved by checkpoint.save(); fall back to shape inference.
+    if "model_cfg" in state and state["model_cfg"] is not None:
+        return state["model_cfg"]
+
+    sd = state.get("model_state_dict", state.get("model", state))
     vocab_size = sd["embed.weight"].shape[0]
-    n_layer   = max(
-        int(k.split(".")[1]) + 1
-        for k in sd if k.startswith("blocks.")
-    )
-    # n_head from qkv projection: shape (3*d_model, d_model), inferred elsewhere
-    # Try to get from attn weight
-    n_head = 6  # fallback; real value in model config
-    for k, v in sd.items():
-        if "attn.qkv" in k or "attn.c_attn" in k:
-            # q weight shape: (n_head * head_dim, d_model)
-            break
-    ctx = 256  # fallback; stored in model config if available
+    d_model    = sd["embed.weight"].shape[1]
+    n_layer    = max(int(k.split(".")[1]) + 1 for k in sd if k.startswith("blocks."))
+    d_head     = 2 * sd["blocks.0.attn.rope_cos"].shape[1]
+    n_head     = d_model // d_head
+    out_feats  = sd["blocks.0.attn.qkv_proj.weight"].shape[0]
+    n_kv_head  = (out_feats // d_head - n_head) // 2
+    ctx        = sd["blocks.0.attn.rope_cos"].shape[0]
     return dict(vocab_size=vocab_size, d_model=d_model, n_layer=n_layer,
-                n_head=n_head, ctx=ctx)
+                n_head=n_head, n_kv_head=n_kv_head, ctx=ctx)
 
 
 def train(cfg: SFTConfig) -> None:
@@ -317,12 +340,15 @@ def train(cfg: SFTConfig) -> None:
         cfg.vocab_size = inferred["vocab_size"]
         cfg.d_model    = inferred["d_model"]
         cfg.n_layer    = inferred["n_layer"]
+        cfg.n_head     = inferred.get("n_head", cfg.n_head)
+        cfg.n_kv_head  = inferred.get("n_kv_head", cfg.n_kv_head)
 
     model = GPT(cfg.model_config()).to(device)
 
     if cfg.base_ckpt and Path(cfg.base_ckpt).exists():
         state = torch.load(cfg.base_ckpt, map_location=device, weights_only=False)
-        sd    = state.get("model_state_dict", state)
+        # pretrain.py saves under "model"; dpo.py saves under "model_state_dict"
+        sd    = state.get("model_state_dict", state.get("model", state))
         model.load_state_dict(sd, strict=True)
         print(f"Loaded base weights from {cfg.base_ckpt}")
     else:
@@ -340,8 +366,6 @@ def train(cfg: SFTConfig) -> None:
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
         print(f"Resumed SFT run from {cfg.resume}  (step {start_step})")
-
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # ── Steps ───────────────────────────────────────────────────────────────
     n_train   = count_examples(data_dir, "train")
@@ -374,35 +398,34 @@ def train(cfg: SFTConfig) -> None:
             pg["lr"] = lr
 
         optimizer.zero_grad()
-        train_loss = 0.0
+        train_loss = torch.tensor(0.0, device=device)
         for _ in range(cfg.accum_steps):
             x, y = sft_get_batch("train", data_dir, cfg.ctx, cfg.batch_size, device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                 enabled=use_amp):
                 logits, _ = model(x, targets=None)
                 loss = sft_loss(logits, y, cfg.vocab_size) / cfg.accum_steps
-            scaler.scale(loss).backward()
-            train_loss += loss.item()
+            loss.backward()
+            train_loss = train_loss + loss.detach()
 
-        scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         if step % cfg.log_every == 0:
-            elapsed = time.time() - t_start
-            epoch   = step / steps_per_epoch
+            elapsed      = time.time() - t_start
+            epoch        = step / steps_per_epoch
+            train_loss_f = train_loss.item()
             print(
                 f"step {step:>6}/{total_steps}  "
                 f"epoch={epoch:.2f}  "
-                f"loss={train_loss:.4f}  "
+                f"loss={train_loss_f:.4f}  "
                 f"val={val_loss:.4f}  "
                 f"lr={lr:.2e}  "
                 f"gnorm={grad_norm:.2f}  "
                 f"t={elapsed:.0f}s"
             )
             if wb:
-                wb.log({"train/loss": train_loss, "train/lr": lr,
+                wb.log({"train/loss": train_loss_f, "train/lr": lr,
                         "train/grad_norm": grad_norm, "step": step})
 
         if step % cfg.eval_every == 0:
@@ -425,7 +448,7 @@ def train(cfg: SFTConfig) -> None:
 
         if step % cfg.ckpt_every == 0:
             ckpt_path = out_dir / f"ckpt_{step:06d}.pt"
-            save_ckpt(ckpt_path, model, optimizer, step, train_loss)
+            save_ckpt(ckpt_path, model, optimizer, step, train_loss.item())
             print(f"  ↳ saved {ckpt_path}")
 
             if cfg.sample_prompt:
@@ -474,6 +497,8 @@ def _parse() -> SFTConfig:
     p.add_argument("--sample-prompt", default="Write a short email declining a Friday meeting.")
     p.add_argument("--sample-n",      type=int,   default=200)
     p.add_argument("--vocab-size",    type=int,   default=32_000)
+    p.add_argument("--n-kv-head",     type=int,   default=0,
+                   help="GQA KV heads (0 = infer from base-ckpt or use MHA)")
     p.add_argument("--ctx",           type=int,   default=256)
     args = p.parse_args()
 

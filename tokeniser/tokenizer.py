@@ -31,8 +31,9 @@ DOMAIN_TAGS = {
     "cpp": "<|cpp|>",
 }
 
-# uint16 ceiling. Any id at or above this corrupts the .bin silently.
-UINT16_MAX = 65536
+# Number of distinct uint16 values. Any token id at or above this corrupts
+# the .bin file silently when cast to uint16 (wraps to a different token).
+UINT16_RANGE = 65536
 
 
 class Codec:
@@ -43,9 +44,9 @@ class Codec:
         # Hard guarantee: the whole corpus is about to be written as uint16.
         # If the vocab ever exceeds 65535, catch it here, not after a 40-hour
         # run silently wrapped every high token id around to a low one.
-        if self.vocab_size > UINT16_MAX:
+        if self.vocab_size > UINT16_RANGE:
             raise ValueError(
-                f"vocab {self.vocab_size} > {UINT16_MAX}; uint16 corpus unsafe"
+                f"vocab {self.vocab_size} > {UINT16_RANGE}; uint16 corpus unsafe"
             )
 
         self._id = self._resolver()
@@ -74,9 +75,8 @@ class Codec:
     def encode(self, text: str) -> list[int]:
         return self.tok.encode(text).ids
 
-    def decode(self, ids: list[int]) -> str:
-        # skip_special_tokens=False so round-trip tests can see the wrappers.
-        return self.tok.decode(ids, skip_special_tokens=False)
+    def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+        return self.tok.decode(ids, skip_special_tokens=skip_special_tokens)
 
     # -- document formatting ---------------------------------------------
     def encode_document(self, text: str, domain: str) -> list[int]:
@@ -124,10 +124,11 @@ class Codec:
         with open(out_path, "wb") as f:
             for i, (text, domain) in enumerate(docs):
                 ids = self.encode_document(text, domain)
+                # Check BEFORE casting — casting to uint16 wraps values >= 65536
+                # silently, so checking arr.max() after the cast is always < 65536.
+                if ids and max(ids) >= UINT16_RANGE:
+                    raise ValueError(f"token id {max(ids)} >= {UINT16_RANGE}; uint16 unsafe")
                 arr = np.array(ids, dtype=np.uint16)
-                # paranoia: assert nothing overflowed on the way to uint16
-                if arr.max(initial=0) >= UINT16_MAX:
-                    raise ValueError("token id >= 65536 slipped through")
                 f.write(arr.tobytes())
                 total += len(ids)
                 if report_every and i and i % report_every == 0:

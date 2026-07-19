@@ -54,6 +54,7 @@ class TrainConfig:
     vocab_size:  int  = 32_000
     d_model:     int  = 384
     n_head:      int  = 6
+    n_kv_head:   int  = 0       # 0 = MHA; set to < n_head for GQA
     n_layer:     int  = 6
     ctx:         int  = 256
 
@@ -94,6 +95,7 @@ class TrainConfig:
             vocab_size=self.vocab_size,
             d_model=self.d_model,
             n_head=self.n_head,
+            n_kv_head=self.n_kv_head,
             n_layer=self.n_layer,
             ctx=self.ctx,
         )
@@ -146,8 +148,12 @@ def make_optimizer(model: GPT, cfg: TrainConfig) -> torch.optim.AdamW:
 def eval_loss(model: GPT, cfg: TrainConfig, device: torch.device) -> float:
     model.eval()
     losses = []
+    # Fixed seed so val loss is comparable across evals and early stopping is stable.
+    val_gen = torch.Generator()
+    val_gen.manual_seed(0)
     for _ in range(cfg.eval_batches):
-        x, y = get_batch("val", cfg.data_dir, cfg.ctx, cfg.batch_size, device)
+        x, y = get_batch("val", cfg.data_dir, cfg.ctx, cfg.batch_size, device,
+                         generator=val_gen)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                             enabled=device.type == "cuda"):
             _, loss = model(x, y)
@@ -211,7 +217,6 @@ def _save_sample(model: GPT, cfg: TrainConfig, step: int, device: torch.device,
 def train(cfg: TrainConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # ── Model + optimiser ───────────────────────────────────────────────────
     model     = GPT(cfg.model_config()).to(device)
@@ -261,36 +266,37 @@ def train(cfg: TrainConfig) -> None:
 
         # ── Gradient accumulation ────────────────────────────────────────────
         optimizer.zero_grad()
-        train_loss = 0.0
+        train_loss = torch.tensor(0.0, device=device)
         for micro in range(cfg.accum_steps):
             x, y = get_batch("train", cfg.data_dir, cfg.ctx, cfg.batch_size, device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                 enabled=use_amp):
                 _, loss = model(x, y)
             loss = loss / cfg.accum_steps
-            scaler.scale(loss).backward()
-            train_loss += loss.item()
+            loss.backward()
+            # Accumulate as tensor to avoid a GPU sync on every micro-step.
+            train_loss = train_loss + loss.detach()
 
         # ── Grad clip → step ─────────────────────────────────────────────────
-        scaler.unscale_(optimizer)
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         # ── Logging ──────────────────────────────────────────────────────────
         if step % cfg.log_every == 0:
-            elapsed = time.time() - t_start
-            tok_s   = tps * step / elapsed
+            elapsed      = time.time() - t_start
+            # Count only steps taken this run (not steps from a resumed checkpoint).
+            tok_s        = tps * (step - start_step) / elapsed
+            train_loss_f = train_loss.item()
             print(
                 f"step {step:>6}/{cfg.max_steps}  "
-                f"loss={train_loss:.4f}  "
+                f"loss={train_loss_f:.4f}  "
                 f"val={val_loss:.4f}  "
                 f"lr={lr:.2e}  "
                 f"gnorm={grad_norm:.2f}  "
                 f"tok/s={tok_s:,.0f}"
             )
             if wb:
-                wb.log({"train/loss": train_loss, "train/lr": lr,
+                wb.log({"train/loss": train_loss_f, "train/lr": lr,
                         "train/grad_norm": grad_norm, "step": step})
 
         # ── Validation ───────────────────────────────────────────────────────
@@ -303,7 +309,7 @@ def train(cfg: TrainConfig) -> None:
         # ── Checkpoint ───────────────────────────────────────────────────────
         if step % cfg.ckpt_every == 0:
             ckpt_path = Path(cfg.out_dir) / f"ckpt_{step:06d}.pt"
-            save_ckpt(ckpt_path, model, optimizer, step, train_loss)
+            save_ckpt(ckpt_path, model, optimizer, step, train_loss.item())
             print(f"  ↳ saved {ckpt_path}")
 
         # ── Sample progression ────────────────────────────────────────────────
@@ -328,6 +334,8 @@ def _parse() -> TrainConfig:
     p.add_argument("--warmup-steps", type=int,   default=200)
     p.add_argument("--batch-size",   type=int,   default=8)
     p.add_argument("--accum-steps",  type=int,   default=4)
+    p.add_argument("--n-kv-head",    type=int,   default=0,
+                   help="GQA KV heads (0 = full MHA)")
     p.add_argument("--ctx",          type=int,   default=256)
     p.add_argument("--lr",           type=float, default=3e-4)
     p.add_argument("--min-lr",       type=float, default=3e-5)

@@ -18,6 +18,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # rsqrt(mean(x²) + eps) == 1 / sqrt(mean(x²) + eps)
-        norm = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return x * norm * self.weight
+        # Compute norm in fp32 to avoid precision loss under bf16 autocast,
+        # then cast back to the input dtype before scaling.
+        input_dtype = x.dtype
+        x_fp32 = x.float()
+        norm = x_fp32.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x_fp32 * norm).to(input_dtype) * self.weight

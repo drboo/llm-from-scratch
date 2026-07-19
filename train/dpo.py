@@ -185,14 +185,35 @@ def _load_model(ckpt_path: str | None, ctx: int,
     return model.to(device)
 
 
-def _pad_to(ids: list[int], length: int, pad_id: int = 0) -> torch.Tensor:
-    padded = ids + [pad_id] * (length - len(ids))
-    return torch.tensor([padded], dtype=torch.long)
+def _batch_sequence_logprobs(
+    model:      GPT,
+    ids_list:   list[list[int]],
+    labels_list: list[list[int]],
+    device:     torch.device,
+) -> torch.Tensor:
+    """Compute sequence_logprobs for a batch of variable-length sequences in one forward pass.
 
+    Returns a (B,) tensor of summed log-probs, one per sequence.
+    """
+    max_len = max(len(ids) for ids in ids_list)
+    B = len(ids_list)
+    batch_ids    = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    batch_labels = torch.full((B, max_len), -100, dtype=torch.long, device=device)
+    for i, (ids, labs) in enumerate(zip(ids_list, labels_list)):
+        batch_ids[i, :len(ids)]    = torch.tensor(ids,  dtype=torch.long)
+        batch_labels[i, :len(labs)] = torch.tensor(labs, dtype=torch.long)
 
-def _pad_labels_to(labels: list[int], length: int) -> torch.Tensor:
-    padded = labels + [-100] * (length - len(labels))
-    return torch.tensor([padded], dtype=torch.long)
+    logits, _ = model(batch_ids)                  # (B, T, V)
+    shift_logits = logits[:, :-1, :]              # (B, T-1, V)
+    shift_labels = batch_labels[:, 1:]            # (B, T-1)
+
+    log_probs  = F.log_softmax(shift_logits, dim=-1)
+    token_logps = log_probs.gather(
+        2, shift_labels.clamp(min=0).unsqueeze(-1)
+    ).squeeze(-1)                                 # (B, T-1)
+
+    mask = (shift_labels != -100).float()
+    return (token_logps * mask).sum(dim=-1)       # (B,)
 
 
 # ---------------------------------------------------------------------------
@@ -254,60 +275,48 @@ def train(cfg: DPOConfig) -> dict:
         indices = torch.randint(len(train_examples),
                                 (cfg.batch_size,), generator=rng)
 
-        batch_loss    = torch.tensor(0.0, device=device)
-        batch_margin  = torch.tensor(0.0, device=device)
-        valid_in_batch = 0
-
+        ctx = policy.cfg.ctx
+        c_ids_batch, c_lab_batch = [], []
+        r_ids_batch, r_lab_batch = [], []
         for idx in indices:
             (c_ids, c_lab), (r_ids, r_lab) = train_examples[idx.item()]
+            c_ids_batch.append(c_ids[:ctx]); c_lab_batch.append(c_lab[:ctx])
+            r_ids_batch.append(r_ids[:ctx]); r_lab_batch.append(r_lab[:ctx])
 
-            ctx = policy.cfg.ctx
+        # Two forwards (ref + policy) over 2*B sequences instead of 4*B forwards.
+        all_ids  = c_ids_batch + r_ids_batch
+        all_labs = c_lab_batch + r_lab_batch
 
-            # Truncate to model context
-            c_ids = c_ids[:ctx]; c_lab = c_lab[:ctx]
-            r_ids = r_ids[:ctx]; r_lab = r_lab[:ctx]
+        with torch.no_grad():
+            ref_logps = _batch_sequence_logprobs(ref_model, all_ids, all_labs, device)
+        pol_logps = _batch_sequence_logprobs(policy, all_ids, all_labs, device)
 
-            c_ids_t = torch.tensor([c_ids], dtype=torch.long, device=device)
-            c_lab_t = torch.tensor([c_lab], dtype=torch.long, device=device)
-            r_ids_t = torch.tensor([r_ids], dtype=torch.long, device=device)
-            r_lab_t = torch.tensor([r_lab], dtype=torch.long, device=device)
-
-            # Reference log-probs (no grad)
-            with torch.no_grad():
-                ref_c_logps = sequence_logprobs(ref_model, c_ids_t, c_lab_t)
-                ref_r_logps = sequence_logprobs(ref_model, r_ids_t, r_lab_t)
-
-            # Policy log-probs (with grad)
-            pol_c_logps = sequence_logprobs(policy, c_ids_t, c_lab_t)
-            pol_r_logps = sequence_logprobs(policy, r_ids_t, r_lab_t)
-
-            loss, margin = dpo_loss(
-                pol_c_logps.unsqueeze(0), pol_r_logps.unsqueeze(0),
-                ref_c_logps.unsqueeze(0), ref_r_logps.unsqueeze(0),
-                cfg.beta,
-            )
-            batch_loss   = batch_loss   + loss   / cfg.batch_size
-            batch_margin = batch_margin + margin / cfg.batch_size
-            valid_in_batch += 1
-
-        if valid_in_batch == 0:
-            step += 1
-            continue
+        B = cfg.batch_size
+        loss, margin = dpo_loss(
+            pol_logps[:B], pol_logps[B:],
+            ref_logps[:B], ref_logps[B:],
+            cfg.beta,
+        )
 
         optimizer.zero_grad()
-        batch_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
         step += 1
 
+        batch_loss   = loss.detach()
+        batch_margin = margin.detach()
+
         if step % cfg.log_every == 0:
+            loss_val   = batch_loss.item()
+            margin_val = batch_margin.item()
             print(f"  step {step:4d}/{cfg.n_steps}  "
-                  f"loss={batch_loss.item():.4f}  "
-                  f"margin={batch_margin.item():.4f}")
+                  f"loss={loss_val:.4f}  "
+                  f"margin={margin_val:.4f}")
             history.append({
                 "step":   step,
-                "loss":   batch_loss.item(),
-                "margin": batch_margin.item(),
+                "loss":   loss_val,
+                "margin": margin_val,
             })
 
         # ── Validation ───────────────────────────────────────────────────────
@@ -345,30 +354,34 @@ def train(cfg: DPOConfig) -> dict:
 
 def _eval(policy: GPT, ref: GPT, examples: list, cfg: DPOConfig,
           device: torch.device) -> float:
+    ctx   = policy.cfg.ctx
     total = 0.0
     count = 0
-    ctx   = policy.cfg.ctx
+    batch_size = cfg.batch_size
+
     with torch.no_grad():
-        for (c_ids, c_lab), (r_ids, r_lab) in examples:
-            c_ids = c_ids[:ctx]; c_lab = c_lab[:ctx]
-            r_ids = r_ids[:ctx]; r_lab = r_lab[:ctx]
-            c_ids_t = torch.tensor([c_ids], dtype=torch.long, device=device)
-            c_lab_t = torch.tensor([c_lab], dtype=torch.long, device=device)
-            r_ids_t = torch.tensor([r_ids], dtype=torch.long, device=device)
-            r_lab_t = torch.tensor([r_lab], dtype=torch.long, device=device)
+        for i in range(0, len(examples), batch_size):
+            chunk = examples[i : i + batch_size]
+            c_ids_b = [c[:ctx] for (c, _), _ in chunk]
+            c_lab_b = [l[:ctx] for (_, l), _ in chunk]
+            r_ids_b = [c[:ctx] for _, (c, _) in chunk]
+            r_lab_b = [l[:ctx] for _, (_, l) in chunk]
 
-            ref_c  = sequence_logprobs(ref,    c_ids_t, c_lab_t)
-            ref_r  = sequence_logprobs(ref,    r_ids_t, r_lab_t)
-            pol_c  = sequence_logprobs(policy, c_ids_t, c_lab_t)
-            pol_r  = sequence_logprobs(policy, r_ids_t, r_lab_t)
+            all_ids  = c_ids_b + r_ids_b
+            all_labs = c_lab_b + r_lab_b
 
+            ref_logps = _batch_sequence_logprobs(ref,    all_ids, all_labs, device)
+            pol_logps = _batch_sequence_logprobs(policy, all_ids, all_labs, device)
+
+            B = len(chunk)
             loss, _ = dpo_loss(
-                pol_c.unsqueeze(0), pol_r.unsqueeze(0),
-                ref_c.unsqueeze(0), ref_r.unsqueeze(0),
+                pol_logps[:B], pol_logps[B:],
+                ref_logps[:B], ref_logps[B:],
                 cfg.beta,
             )
-            total += loss.item()
-            count += 1
+            total += loss.item() * B
+            count += B
+
     return total / count if count > 0 else float("inf")
 
 

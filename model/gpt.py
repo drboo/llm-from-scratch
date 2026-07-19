@@ -105,6 +105,38 @@ class GPT(nn.Module):
         """Total parameters, counting tied weights only once."""
         return sum(p.numel() for p in self.parameters())
 
+    @classmethod
+    def from_checkpoint(cls, path: str | Path,
+                        device: str | torch.device = "cpu") -> "GPT":
+        """Load a GPT from a checkpoint, inferring architecture automatically.
+
+        Prefers the 'model_cfg' key written by checkpoint.save(); falls back
+        to inferring the config from state-dict shapes for older checkpoints.
+        """
+        state = torch.load(path, map_location=device, weights_only=False)
+        sd    = state.get("model_state_dict", state.get("model", state))
+
+        if "model_cfg" in state and state["model_cfg"] is not None:
+            cfg = ModelConfig(**{k: v for k, v in state["model_cfg"].items()
+                                 if k in ModelConfig.__dataclass_fields__})
+        else:
+            vocab_size = sd["embed.weight"].shape[0]
+            d_model    = sd["embed.weight"].shape[1]
+            n_layer    = max(int(k.split(".")[1]) for k in sd
+                             if k.startswith("blocks.")) + 1
+            d_head    = 2 * sd["blocks.0.attn.rope_cos"].shape[1]
+            n_head    = d_model // d_head
+            out_feats = sd["blocks.0.attn.qkv_proj.weight"].shape[0]
+            n_kv_head = (out_feats // d_head - n_head) // 2
+            ctx       = sd["blocks.0.attn.rope_cos"].shape[0]
+            cfg = ModelConfig(vocab_size=vocab_size, d_model=d_model,
+                              n_head=n_head, n_kv_head=n_kv_head,
+                              n_layer=n_layer, ctx=ctx)
+
+        model = cls(cfg)
+        model.load_state_dict(sd, strict=True)
+        return model.to(device)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
